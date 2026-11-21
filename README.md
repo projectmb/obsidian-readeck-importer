@@ -137,7 +137,9 @@ _No highlights yet._
 
 ### Highlights-only template
 
-Select **Annotations**, choose **Flat** if desired, then choose **Highlights only (type: Notes)** under **Template preset**. Alternatively select **templateNotes (your Notes layout)** for the adapted vault template with dates, title, author, Notes, Source and Link fields. The selected template is saved and reused on subsequent imports and restarts; no repeated pasting is required. You can still edit it under **Note template**. The source examples are [highlights-only.njk](examples/highlights-only.njk) and [templateNotes.njk](examples/templateNotes.njk). This example sets `type: Notes`, includes article metadata, and renders multiline highlights and their associated notes with links to Readeck. It contains no article body. Templates also work with all four full-article modes; include `{{ content }}` to display their article text.
+Select **Annotations**, choose **Flat** if desired, then choose **Highlights only (type: Notes)** under **Template preset**. This preset includes article metadata, multiline highlights, and associated notes with links to Readeck. Its source is [highlights-only.njk](examples/highlights-only.njk).
+
+Choose **templateNotes (your Notes layout)** for the vault template with dates, title, author, Notes, Source, and Link fields. In a mode that imports article text, it places Readeck’s Markdown below the Link field so the original heading levels, paragraphs, lists, and other Markdown formatting carry through. In **Annotations** mode it renders highlights and their notes. The preset is copied into **Note template** when selected. Select it again to load the updated version, or copy the `{% if content %}` block into your saved template if you’ve customized it. [templateNotes.njk](examples/templateNotes.njk)
 
 ### Synchronisation and existing notes
 

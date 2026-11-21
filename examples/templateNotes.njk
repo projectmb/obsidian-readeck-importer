@@ -25,3 +25,7 @@ Author:: {{ authors | join(", ") }}
 Source: {{ url }}
 
 Link::
+{% if content %}
+
+{{ content }}
+{% endif %}

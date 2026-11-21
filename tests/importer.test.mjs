@@ -270,6 +270,27 @@ test('templateNotes preserves the vault template structure and renders highlight
   assert(!text.includes('FULL ARTICLE SECRET'));
 });
 
+test('templateNotes preserves the article Markdown below the note fields', async () => {
+  const template = readFileSync('examples/templateNotes.njk', 'utf8').replace(/\r\n/g, '\n');
+  const f = fixture({ mode: 'textAnnotations', template });
+  const article = '# Article\n\nIntro with **emphasis** and a [link](https://article.example).\n\n' +
+    '## Section\n\n- First item\n  - Nested item\n\n> Block quote\n\n```text\n{{ literal }} & <example>\n```';
+  f.bookmarks[0].text = '---\r\ntitle: "A --- title"\r\n---\r\n' + article;
+  await f.service.getReadeckData();
+  const text = notes(f)[0][1];
+  assert(text.includes('## Notes\n\n> Highlighted passage'));
+  assert(text.includes('Link::\n\n' + article));
+  assert(!text.includes('A --- title'));
+});
+
+test('article Markdown keeps horizontal rules that resemble frontmatter delimiters', async () => {
+  const f = fixture({ mode: 'text' });
+  const article = '---\n\n# Article\n\nThe first paragraph has an --- aside.\n\n---\n\n## Section';
+  f.bookmarks[0].text = article;
+  await f.service.getReadeckData();
+  assert(notes(f)[0][1].endsWith(article));
+});
+
 test('ready-made presets render, match the provided examples, and can be identified after settings reload', async () => {
   const { TEMPLATE_PRESETS, templatePresetId } = runtime.exports;
   assert.equal(templatePresetId(''), 'default');

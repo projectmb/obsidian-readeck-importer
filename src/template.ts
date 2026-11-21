@@ -43,7 +43,7 @@ export const TEMPLATE_PRESETS = [
 	{
 		"id": "templateNotes",
 		"name": "templateNotes (your Notes layout)",
-		"source": "---\ndateModified: {{ now | date(\"YYYY-MM-DD\") | yaml }}\ndateCreated: {{ now | date(\"YYYY-MM-DD\") | yaml }}\ntitle: {{ title | yaml }}\narea:\ntype: \ud83d\udcd3Note\n---\n\nDate created: [[{{ now | date(\"YYYY-MM-DD\") }}]]\nTitle: [[{{ title }}]]\nAuthor:: {{ authors | join(\", \") }}\n\n## Notes\n\n{% for highlight in highlights %}\n{{ highlight.text | blockquote }}\n> [Open highlight in Readeck]({{ highlight.readeck_url }})\n{% if highlight.note %}\n>\n> **Note:**\n{{ highlight.note | blockquote }}\n{% endif %}\n\n{% endfor %}\nSource: {{ url }}\n\nLink::\n"
+		"source": "---\ndateModified: {{ now | date(\"YYYY-MM-DD\") | yaml }}\ndateCreated: {{ now | date(\"YYYY-MM-DD\") | yaml }}\ntitle: {{ title | yaml }}\narea:\ntype: \ud83d\udcd3Note\n---\n\nDate created: [[{{ now | date(\"YYYY-MM-DD\") }}]]\nTitle: [[{{ title }}]]\nAuthor:: {{ authors | join(\", \") }}\n\n## Notes\n\n{% for highlight in highlights %}\n{{ highlight.text | blockquote }}\n> [Open highlight in Readeck]({{ highlight.readeck_url }})\n{% if highlight.note %}\n>\n> **Note:**\n{{ highlight.note | blockquote }}\n{% endif %}\n\n{% endfor %}\nSource: {{ url }}\n\nLink::\n{% if content %}\n\n{{ content }}\n{% endif %}\n"
 	}
 ];
 

@@ -287,8 +287,18 @@ export class BookmarksService {
 			const bookmark: BookmarkData = bookmarksData.get(bookmarkId)!;
 			if (mediaType == 'text/markdown') {
 				const markdownContent = await partData.text();
-				// Remove bookmark properties if present
-				bookmark.text = markdownContent.replace(/^---[\s\S]*?---\s*/, '');
+				bookmark.text = markdownContent;
+				const frontmatter = /^---[ \t]*\r?\n((?:[^\n]*\n)*?)---[ \t]*(?:\r?\n|$)/.exec(markdownContent);
+				if (frontmatter) {
+					try {
+						const properties = parseYaml(frontmatter[1]);
+						if (properties && typeof properties === 'object' && !Array.isArray(properties)) {
+							bookmark.text = markdownContent.slice(frontmatter[0].length);
+						}
+					} catch {
+						// A leading horizontal rule can look like a frontmatter delimiter.
+					}
+				}
 			} else if (mediaType.includes('image')) {
 				bookmark.images.push({
 					filename: partData.filename,
