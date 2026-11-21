@@ -1,6 +1,7 @@
-import { App, ButtonComponent, Modal, Notice, PluginSettingTab, Setting, TextComponent } from "obsidian";
+import { App, ButtonComponent, debounce, DropdownComponent, Modal, Notice, PluginSettingTab, Setting, TextAreaComponent, TextComponent, ToggleComponent } from "obsidian";
 
 import ReadeckPlugin from "./plugin";
+import { DEFAULT_TEMPLATE, FILTER_REFERENCE, NoteTemplate, TEMPLATE_PRESETS, templatePresetId, TEMPLATE_REFERENCE } from "./template";
 
 export class RDSettingTab extends PluginSettingTab {
 	plugin: ReadeckPlugin;
@@ -188,6 +189,17 @@ export class RDSettingTab extends PluginSettingTab {
 				}));
 
 		new Setting(containerEl)
+			.setName('Note layout')
+			.setDesc('Folder per bookmark: each note in its own folder named after the Readeck id. Flat: all notes directly in the folder, images in attachments/<id>; notes are found again by readeck_id in their frontmatter, so they can be renamed or moved. Existing notes are not moved when you switch.')
+			.addDropdown(dropdown => dropdown
+				.addOptions({ folder: 'Folder per bookmark', flat: 'Flat' })
+				.setValue(this.plugin.settings.layout)
+				.onChange(async (value) => {
+					this.plugin.settings.layout = value as "folder" | "flat";
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
 			.setName('Set mode')
 			.setDesc('Set how the note is created')
 			.addDropdown((dropdown) => {
@@ -205,6 +217,136 @@ export class RDSettingTab extends PluginSettingTab {
 						await this.plugin.saveData(this.plugin.settings);
 					})
 			});
+
+		// Note template â€” empty means the built-in default
+		let templateArea: TextAreaComponent;
+		let presetDropdown: DropdownComponent;
+		new Setting(containerEl)
+			.setName('Template preset')
+			.setDesc('Choose a ready-to-use template. Your selection is saved for future imports. Choose Annotations mode for highlights-only imports. You can edit the template below afterward.')
+			.addDropdown(dropdown => {
+				presetDropdown = dropdown;
+				for (const preset of TEMPLATE_PRESETS) dropdown.addOption(preset.id, preset.name);
+				dropdown.addOption('custom', 'Custom');
+				dropdown.setValue(templatePresetId(this.plugin.settings.template));
+				dropdown.onChange(async id => {
+					const preset = TEMPLATE_PRESETS.find(item => item.id === id);
+					if (!preset) return;
+					validateTemplateSoon.cancel();
+					this.plugin.settings.template = preset.source;
+					templateArea.setValue(preset.source || DEFAULT_TEMPLATE);
+					showTemplateStatus(null);
+					await this.plugin.saveSettings();
+				});
+			});
+		// Validate only after a typing pause, so half-typed tags do not flash an error
+		const validateTemplateSoon = debounce((value: string) => showTemplateStatus(NoteTemplate.validate(value)), 800, true);
+		const templateSetting = new Setting(containerEl)
+			.setName('Note template')
+			.setDesc('Nunjucks template for each imported note. Variables include title, url, content, highlights, labels and frontmatter; filters include date, blockquote and yaml. See the README for the full list.')
+			.addButton(btn => btn
+				.setButtonText('Reset to default')
+				.onClick(async () => {
+					this.plugin.settings.template = '';
+					validateTemplateSoon.cancel();
+					presetDropdown.setValue('default');
+					await this.plugin.saveSettings();
+					templateArea.setValue(DEFAULT_TEMPLATE);
+					showTemplateStatus(null);
+				}));
+		templateSetting.settingEl.style.borderBottom = 'none';
+
+		templateArea = new TextAreaComponent(containerEl)
+			.setValue(this.plugin.settings.template || DEFAULT_TEMPLATE)
+			.onChange(async (value) => {
+				// Store the default as empty, so future default improvements reach this user
+				this.plugin.settings.template = value === DEFAULT_TEMPLATE ? '' : value;
+				presetDropdown.setValue(templatePresetId(this.plugin.settings.template));
+				await this.plugin.saveSettings();
+				showTemplateStatus(null);
+				validateTemplateSoon(value);
+			});
+		templateArea.inputEl.rows = 14;
+		templateArea.inputEl.style.width = '100%';
+		templateArea.inputEl.style.fontFamily = 'var(--font-monospace)';
+		templateArea.inputEl.spellcheck = false;
+
+		const templateStatusEl = containerEl.createEl('p', { cls: 'mod-warning' });
+		const showTemplateStatus = (error: string | null) => {
+			templateStatusEl.setText(error ? `Template error (sync will stop until fixed): ${error}` : '');
+			templateStatusEl.style.display = error ? '' : 'none';
+		};
+		showTemplateStatus(NoteTemplate.validate(this.plugin.settings.template));
+
+		// Reference of variables and filters, right where the template is written
+		const reference = containerEl.createEl('details');
+		reference.style.marginBottom = '1em';
+		reference.createEl('summary', { text: 'Available variables and filters' });
+		const addRows = (heading: string, rows: { name: string; description: string }[], format: (name: string) => string) => {
+			reference.createEl('p', { text: heading }).style.marginBottom = '0.25em';
+			const list = reference.createEl('ul');
+			list.style.marginTop = '0';
+			for (const row of rows) {
+				const item = list.createEl('li');
+				item.createEl('code', { text: format(row.name) });
+				item.appendText(` ${row.description}`);
+			}
+		};
+		addRows('Variables', TEMPLATE_REFERENCE, name => `{{ ${name} }}`);
+		addRows('Filters', FILTER_REFERENCE, name => `| ${name}`);
+		reference.createEl('p', { text: 'Loops and conditions: {% for highlight in highlights %} â€¦ {% endfor %}, {% if published %} â€¦ {% endif %}. All built-in Nunjucks filters work too.' });
+
+		// Collections filter — loaded automatically on display, refreshable manually
+		const collectionsSetting = new Setting(containerEl)
+			.setName('Filter by collections')
+			.setDesc('Sync only bookmarks belonging to the selected collections. Leave all unchecked to sync everything.');
+
+		const collectionsContainer = containerEl.createDiv();
+		collectionsContainer.style.paddingLeft = '1rem';
+		collectionsContainer.style.paddingBottom = '0.5rem';
+
+		// Render checkboxes for already-known collections (e.g. after settings reload)
+		const renderCollectionToggles = async () => {
+			collectionsContainer.empty();
+			let collections;
+			try {
+				collections = await this.plugin.api.getCollections();
+			} catch (err) {
+				collectionsContainer.createEl('p', { text: `Failed to load collections: ${err.message}`, cls: 'mod-warning' });
+				return;
+			}
+			if (collections.length === 0) {
+				collectionsContainer.createEl('p', { text: 'No collections found.' });
+				return;
+			}
+			for (const collection of collections) {
+				new Setting(collectionsContainer)
+					.setName(collection.name)
+					.addToggle((toggle: ToggleComponent) => {
+						toggle
+							.setValue(this.plugin.settings.filterCollections.includes(collection.id))
+							.onChange(async (value) => {
+								if (value) {
+									if (!this.plugin.settings.filterCollections.includes(collection.id)) {
+										this.plugin.settings.filterCollections.push(collection.id);
+									}
+								} else {
+									this.plugin.settings.filterCollections =
+										this.plugin.settings.filterCollections.filter(id => id !== collection.id);
+								}
+								await this.plugin.saveSettings();
+							});
+					});
+			}
+		};
+
+		collectionsSetting.addButton(btn => btn
+			.setButtonText('Refresh')
+			.onClick(renderCollectionToggles));
+
+		// Auto-load collections when the settings page opens
+		if (loggedIn) void renderCollectionToggles();
+
 	}
 }
 

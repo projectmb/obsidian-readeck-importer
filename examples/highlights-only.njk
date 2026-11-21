@@ -1,0 +1,26 @@
+---
+type: Notes
+title: {{ title | yaml }}
+url: {{ url | yaml }}
+readeck_url: {{ readeck_url | yaml }}
+created: {{ created | date("YYYY-MM-DD") | yaml }}
+authors: {{ authors | yaml }}
+tags: {{ labels | yaml }}
+---
+
+# {{ title }}
+
+[Original article]({{ url }}) · [Open in Readeck]({{ readeck_url }})
+
+## Highlights
+
+{% for highlight in highlights %}
+> [!quote] [Open highlight in Readeck]({{ highlight.readeck_url }})
+{{ highlight.text | blockquote }}
+{% if highlight.note %}
+>
+> **Note:**
+{{ highlight.note | blockquote }}
+{% endif %}
+
+{% endfor %}

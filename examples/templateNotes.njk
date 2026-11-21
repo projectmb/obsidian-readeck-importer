@@ -1,0 +1,27 @@
+---
+dateModified: {{ now | date("YYYY-MM-DD") | yaml }}
+dateCreated: {{ now | date("YYYY-MM-DD") | yaml }}
+title: {{ title | yaml }}
+area:
+type: 📓Note
+---
+
+Date created: [[{{ now | date("YYYY-MM-DD") }}]]
+Title: [[{{ title }}]]
+Author:: {{ authors | join(", ") }}
+
+## Notes
+
+{% for highlight in highlights %}
+{{ highlight.text | blockquote }}
+> [Open highlight in Readeck]({{ highlight.readeck_url }})
+{% if highlight.note %}
+>
+> **Note:**
+{{ highlight.note | blockquote }}
+{% endif %}
+
+{% endfor %}
+Source: {{ url }}
+
+Link::

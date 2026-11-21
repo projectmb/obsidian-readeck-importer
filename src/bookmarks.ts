@@ -1,8 +1,10 @@
-import { App, Notice, TFile, TFolder } from "obsidian";
+import { App, Notice, parseYaml, TFile, TFolder } from "obsidian";
 import { Annotation, Bookmark, BookmarkData, BookmarkStatus, ReadeckPluginSettings } from "./interfaces";
 import { ReadeckApi } from "./api";
 import { Utils } from "./utils";
 import { MultipartPart } from "@mjackson/multipart-parser";
+import { attachmentsFolder, relinkImagesToAttachments, uniqueNotePath, withReadeckId } from "./layout";
+import { NoteTemplate, buildTemplateContext, templateErrorMessage } from "./template";
 
 type BookmarksServiceDeps = {
 	app: App;
@@ -12,6 +14,7 @@ type BookmarksServiceDeps = {
 };
 
 export class BookmarksService {
+	private syncing = false;
 	private app: App;
 	private api: ReadeckApi;
 	private getSettings: () => ReadeckPluginSettings;
@@ -37,7 +40,27 @@ export class BookmarksService {
 	* 5. Update last sync time
 	*/
 	async getReadeckData() {
+		if (this.syncing) return;
+		this.syncing = true;
+		try {
+			await this.sync();
+		} finally {
+			this.syncing = false;
+		}
+	}
+
+	private async sync() {
+		const syncStartedAt = new Date().toISOString();
 		const { lastSyncAt } = this.settings;
+
+		// Compile the note template first, so a broken template stops the sync before anything is written
+		let noteTemplate: NoteTemplate;
+		try {
+			noteTemplate = new NoteTemplate(this.settings.template);
+		} catch (error) {
+			new Notice(`Readeck importer: Note template has an error, sync stopped: ${templateErrorMessage(error)}`, 15000);
+			return;
+		}
 
 		// Get bookmark status since last sync
 		let bookmarksStatus: BookmarkStatus[] = [];
@@ -58,10 +81,7 @@ export class BookmarksService {
 		}
 
 		// Ensure bookmarks folder exists
-		const bookmarksFolder = this.app.vault.getAbstractFileByPath(this.settings.folder);
-		if (!bookmarksFolder) {
-			await this.app.vault.createFolder(this.settings.folder);
-		}
+		await this.createFolderIfNotExists("", this.settings.folder);
 
 		// Determine what data to fetch based on mode
 		let get = {
@@ -84,18 +104,39 @@ export class BookmarksService {
 		} else if (this.settings.mode == "annotations") {
 			get.annotations = true;
 		}
-		
-		// Initialize bookmarks data structure (a map of bookmark ID to its data)
-		const toUpdateIds = bookmarksStatus.filter(b => b.type === 'update').map(b => b.id);
+
+		const { filterCollections } = this.settings;
+		const hasCollectionFilter = filterCollections.length > 0;
+
+		// Extract only updated bookmark IDs (ignore deletes at this stage)
+		let toUpdateIds = bookmarksStatus.filter(b => b.type === 'update').map(b => b.id);
+
+		if (hasCollectionFilter && toUpdateIds.length > 0) {
+			try {
+				// One API call per selected collection; results are OR-unioned.
+				const calls = filterCollections.map(id =>
+					this.api.filterBookmarkIds(toUpdateIds, id)
+				);
+				const idSets = await Promise.all(calls);
+				const unionSet = new Set(idSets.flat());
+				toUpdateIds = toUpdateIds.filter(id => unionSet.has(id));
+			} catch (error) {
+				new Notice(`Readeck importer: Error filtering bookmarks, error ${error}`);
+				return;
+			}
+		}
+
+
 		const bookmarksData = new Map<string, BookmarkData>();
 		for (const id of toUpdateIds) {
 			bookmarksData.set(id, { id: id, text: null, json: { title: '' }, images: [], annotations: [] });
 		}
 
 		// Fetch bookmarks data in multipart format
-		const bookmarksMPData = await this.getBookmarksData(toUpdateIds, get.md, get.res, true);
-		// Parse multipart data
-		await this.parseBookmarksMP(bookmarksData, bookmarksMPData);		
+		if (toUpdateIds.length > 0) {
+			const bookmarksMPData = await this.getBookmarksData(toUpdateIds, get.md, get.res, true);
+			await this.parseBookmarksMP(bookmarksData, bookmarksMPData);
+		}
 
 		if (get.annotations) {
 			// Fetch annotations for each updated bookmark
@@ -108,41 +149,115 @@ export class BookmarksService {
 			}
 		}
 
+		const flat = this.settings.layout === "flat";
+		const notesById = await this.notesByReadeckId();
+		let renderFailed = false;
+
 		// Process each bookmark
 		for (const [id, bookmark] of bookmarksData.entries()) {
 			// Create markdown note
-			if (bookmark.text || bookmark.annotations.length > 0) {
-				// Create bookmark folder
-				const bookmarkFolderPath = `${this.settings.folder}/${id}`;
+			if ((get.md && bookmark.text) || bookmark.annotations.length > 0) {
+				// Legacy folder notes stay in place when the layout setting changes.
+				const bookmarkFolderPath = flat ? this.settings.folder : `${this.settings.folder}/${id}`;
+				const article = get.md ? (bookmark.text || '') : '';
+				const content = flat ? relinkImagesToAttachments(article, this.settings.folder, id) : article;
+				const context = buildTemplateContext(
+					this.settings.apiUrl, id, bookmark.json, content,
+					bookmark.annotations, this.generateBookmarkHeader(bookmark.json),
+					get.res ? this.thumbnailPath(id, bookmark) : "",
+				);
+				let noteContent: string;
+				try {
+					noteContent = withReadeckId(noteTemplate.render(context), id);
+				} catch (error) {
+					new Notice(`Readeck importer: Could not render note for ${bookmark.json.title}: ${templateErrorMessage(error)}`, 15000);
+					renderFailed = true;
+					continue;
+				}
+				const legacyFolder = this.app.vault.getAbstractFileByPath(`${this.settings.folder}/${id}`);
+				if (flat && !notesById.has(id) && legacyFolder instanceof TFolder) {
+					new Notice(`Readeck importer: Keeping existing folder for ${bookmark.json.title}; no automatic migration`);
+					continue;
+				}
+				if (flat || notesById.has(id)) {
+					await this.writeFlatNote(id, bookmark.json.title, noteContent, notesById);
+				} else {
 				await this.createFolderIfNotExists(id, bookmarkFolderPath);
-				const bookmarkHeader = this.generateBookmarkHeader(bookmark.json);
-				const bookmarkContent = bookmarkHeader + (bookmark.text || '');
-				this.addBookmarkMD(id, bookmark.json.title, bookmarkContent, bookmark.annotations, bookmarkFolderPath);
+					const filePath = `${bookmarkFolderPath}/${Utils.sanitizeFileName(bookmark.json.title) || 'Untitled'}.md`;
+					await this.createFile(bookmark.json.title, filePath, noteContent);
+				}
 			}
 
 			// Save images
-			if (bookmark.images.length > 0 && bookmark.json) {
-				const bookmarkImgsFolderPath = `${this.settings.folder}/${id}/imgs`;
+			if (get.res && bookmark.images.length > 0 && bookmark.json) {
+				const bookmarkImgsFolderPath = attachmentsFolder(this.settings.folder, id, this.settings.layout);
 				await this.createFolderIfNotExists(id, bookmarkImgsFolderPath);
 				for (const image of bookmark.images) {
 					const filePath = `${bookmarkImgsFolderPath}/${image.filename}`;
-					await this.createFile(bookmark.json.title, filePath, image.content, false);
+					await this.createFile(bookmark.json.title, filePath, image.content, false, true);
 				}
 			}
 		}
+
+		// Retry failed renders on the next sync; do not advance the cursor or delete notes.
+		if (renderFailed) return;
 
 		// Delete removed bookmarks
 		if (this.settings.delete) {
 			const toDeleteIds = bookmarksStatus.filter(b => b.type === 'delete').map(b => b.id);
 			for (const id of toDeleteIds) {
-				const bookmarkFolderPath = `${this.settings.folder}/${id}`;
-				await this.deleteFolder(id, bookmarkFolderPath, true);
+				if (flat) {
+					const note = notesById.get(id);
+					if (note) await this.app.vault.delete(note);
+					await this.deleteFolder(id, attachmentsFolder(this.settings.folder, id, "flat"), true);
+				} else {
+					const note = notesById.get(id);
+					if (note) await this.app.vault.delete(note);
+					await this.deleteFolder(id, `${this.settings.folder}/${id}`, true);
+				}
 			}
 		}
 		
 		// Update last sync time
-		this.settings.lastSyncAt = new Date().toLocaleString();
+		this.settings.lastSyncAt = syncStartedAt;
 		await this.saveSettings();
+	}
+
+	/* Every note in the vault whose frontmatter has readeck_id, wherever it was moved to */
+	private async notesByReadeckId(): Promise<Map<string, TFile>> {
+		const notes = new Map<string, TFile>();
+		for (const file of this.app.vault.getMarkdownFiles()) {
+			const cache = this.app.metadataCache.getFileCache(file);
+			let id: unknown = cache?.frontmatter?.readeck_id;
+			// Most notes have cached metadata. Only read files that Obsidian has
+			// not indexed yet, rather than reading the entire vault every sync.
+			if (!cache) {
+				const content = await this.app.vault.read(file);
+				const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+				try { id = match ? parseYaml(match[1])?.readeck_id : undefined; }
+				catch { continue; }
+			}
+			if (typeof id === "string" && id !== "") notes.set(id, file);
+		}
+		return notes;
+	}
+
+	private async writeFlatNote(id: string, title: string, content: string, notesById: Map<string, TFile>) {
+		const existing = notesById.get(id);
+		if (existing) {
+			if (this.settings.overwrite) {
+				await this.app.vault.modify(existing, content);
+				new Notice(`Readeck importer: Overwriting note for ${title}`);
+			} else {
+				new Notice(`Readeck importer: Note for ${title} already exists`);
+			}
+			return;
+		}
+		const path = uniqueNotePath(this.settings.folder, Utils.sanitizeFileName(title),
+			candidate => this.app.vault.getAbstractFileByPath(candidate) !== null);
+		const file = await this.app.vault.create(path, content);
+		notesById.set(id, file);
+		new Notice(`Readeck importer: Creating note for ${title}`);
 	}
 
 	private async getBookmarkAnnotations(bookmarkId: string) {
@@ -163,16 +278,6 @@ export class BookmarksService {
 		return multipart;
 	}
 
-	private async addBookmarkMD(bookmarkId: string, bookmarkTitle: string, bookmarkContent: string | null, bookmarkAnnotations: Annotation[], bookmarkFolderPath?: string) {
-		const filePath = `${bookmarkFolderPath}/${Utils.sanitizeFileName(bookmarkTitle)}.md`;
-		let noteContent = bookmarkContent || '';
-		if (bookmarkAnnotations.length > 0) {
-			const annotations = this.buildAnnotations(bookmarkId, bookmarkAnnotations);
-			noteContent += `\n${annotations}`;
-		}
-		await this.createFile(bookmarkTitle, filePath, noteContent);
-	}
-
 	private async parseBookmarksMP(bookmarksData: Map<string, BookmarkData>, bookmarksMPData: any): Promise<boolean> {
 		const partsData: MultipartPart[] = await Utils.parseMultipart(bookmarksMPData);
 
@@ -187,7 +292,7 @@ export class BookmarksService {
 			} else if (mediaType.includes('image')) {
 				bookmark.images.push({
 					filename: partData.filename,
-					content: partData.body,
+					content: await partData.arrayBuffer(),
 				});
 			} else if (mediaType.includes('json')) {
 				const jsonText = await partData.text();
@@ -205,16 +310,10 @@ export class BookmarksService {
 		return true;
 	}
 
-	private buildAnnotations(bookmarkId: string, bookmarkAnnotations: Annotation[]) {
-		let annotationsContent = "# Annotations\n";
-		if (bookmarkAnnotations.length > 0) {
-			annotationsContent = annotationsContent + bookmarkAnnotations.map(
-				(ann: any) =>
-					`> ${ann.text}` +
-					` - [#](${this.settings.apiUrl}/bookmarks/${bookmarkId}#annotation-${ann.id})`
-			).join('\n\n');
-		}
-		return annotationsContent;
+	/* Vault path the downloaded thumbnail is saved to, or "" when images are not downloaded */
+	private thumbnailPath(id: string, bookmark: BookmarkData): string {
+		const thumbnail = bookmark.images.find(image => /^thumbnail\./i.test(image.filename ?? ""));
+		return thumbnail ? `${attachmentsFolder(this.settings.folder, id, this.settings.layout)}/${thumbnail.filename}` : "";
 	}
 
 	private generateBookmarkHeader(bookmark: Bookmark): string {
@@ -244,13 +343,14 @@ export class BookmarksService {
 		return header;
 	}
 
-	private async createFile(bookmarkTitle: string, filePath: string, content: any, showNotice: boolean = true) {
+	private async createFile(bookmarkTitle: string, filePath: string, content: any, showNotice: boolean = true, binary = false) {
 		const file = this.app.vault.getAbstractFileByPath(filePath);
 
 		if (file && file instanceof TFile) {
 			if (this.settings.overwrite) {
 				// the file exists and overwrite is true
-				await this.app.vault.modify(file, content);
+				if (binary) await this.app.vault.modifyBinary(file, content);
+				else await this.app.vault.modify(file, content);
 				if (showNotice) { new Notice(`Readeck importer: Overwriting note for ${bookmarkTitle}`); }
 			} else {
 				// the file exists and overwrite is false
@@ -258,18 +358,22 @@ export class BookmarksService {
 			}
 		} else if (!file) {
 			// create file if not exists
-			await this.app.vault.create(filePath, content);
+			if (binary) await this.app.vault.createBinary(filePath, content);
+			else await this.app.vault.create(filePath, content);
 			if (showNotice) { new Notice(`Readeck importer: Creating note for ${bookmarkTitle}`); }
 		}
 	}
 
 	private async createFolderIfNotExists(id: string, path: string, showNotice: boolean = false) {
+		if (!path || path === "/") return;
 		const folder = this.app.vault.getAbstractFileByPath(path);
 
 		if (folder && folder instanceof TFolder) {
 			if (showNotice) { new Notice(`Readeck importer: Folder already exists in ${id}`); }
 		} else {
-			// create file if not exists
+			if (folder) throw new Error(`Import folder is a file: ${path}`);
+			const parent = path.split('/').slice(0, -1).join('/');
+			if (parent) await this.createFolderIfNotExists(id, parent);
 			await this.app.vault.createFolder(path);
 			if (showNotice) { new Notice(`Readeck importer: Creating folder for ${id} for Readeck`); }
 		}
